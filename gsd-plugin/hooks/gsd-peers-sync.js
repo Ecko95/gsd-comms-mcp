@@ -4,10 +4,12 @@
 // summary in sync with the current task from STATE.md.
 //
 // How it works:
-// 1. On first tool use in a session, registers with the claude-peers broker
-// 2. Reads STATE.md to extract the current phase/plan/task as the summary
-// 3. Updates the peer summary whenever the task changes
-// 4. Unregisters when the session ends (process exit)
+// 1. On each tool use, calls /session-heartbeat which atomically:
+//    - Registers a peer if none exists for this session
+//    - Updates the session's last_tool_use timestamp
+//    - Syncs the task summary from STATE.md
+// 2. All state lives in the broker's SQLite — no temp files, no cleanup scripts.
+// 3. Session end is handled by the broker's stale peer cleanup (PID check).
 //
 // The hook talks directly to the broker HTTP API (default localhost:7899).
 // No MCP server needed — this is a lightweight sidecar.
@@ -16,34 +18,11 @@
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const http = require('http');
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT || '7899', 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const STATE_FILE = path.join('.planning', 'STATE.md');
-const STALE_SUMMARY_MS = 10_000; // re-read STATE.md at most every 10s
-
-// Persistent state across hook invocations via temp file
-function getStatePath(sessionId) {
-  return path.join(os.tmpdir(), `gsd-peers-${sessionId}.json`);
-}
-
-function readHookState(sessionId) {
-  try {
-    return JSON.parse(fs.readFileSync(getStatePath(sessionId), 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-function writeHookState(sessionId, state) {
-  try {
-    fs.writeFileSync(getStatePath(sessionId), JSON.stringify(state));
-  } catch {
-    // best effort
-  }
-}
 
 // Extract current task summary from STATE.md frontmatter + content
 function extractTaskSummary(cwd) {
@@ -126,7 +105,7 @@ function brokerPost(endpoint, body) {
   });
 }
 
-async function isBrokerAlive() {
+function isBrokerAlive() {
   return new Promise((resolve) => {
     const req = http.get(`${BROKER_URL}/health`, { timeout: 2000 }, (res) => {
       resolve(res.statusCode === 200);
@@ -188,75 +167,22 @@ process.stdin.on('end', async () => {
       process.exit(0);
     }
 
-    let state = readHookState(sessionId);
+    // Single atomic call: registers peer if needed, updates session, syncs summary
+    const gitRoot = getGitRoot(cwd);
+    const summary = extractTaskSummary(cwd) || `GSD executor in ${path.basename(cwd)}`;
 
-    // First invocation: register with broker
-    if (!state) {
-      const gitRoot = getGitRoot(cwd);
-      const summary = extractTaskSummary(cwd) || `GSD executor in ${path.basename(cwd)}`;
-
-      try {
-        const reg = await brokerPost('/register', {
-          pid: process.pid,
-          cwd,
-          git_root: gitRoot,
-          tty: null,
-          summary,
-        });
-
-        if (reg && reg.id) {
-          state = {
-            peerId: reg.id,
-            lastSummary: summary,
-            lastSummaryCheck: Date.now(),
-          };
-          writeHookState(sessionId, state);
-
-          // Register cleanup on process exit
-          const cleanupPath = path.join(os.tmpdir(), `gsd-peers-cleanup-${sessionId}.sh`);
-          // Write a cleanup script that unregisters on exit
-          // This is best-effort — the broker also cleans stale PIDs
-          fs.writeFileSync(
-            cleanupPath,
-            `#!/bin/sh\ncurl -sX POST ${BROKER_URL}/unregister -H 'Content-Type: application/json' -d '{"id":"${reg.id}"}' >/dev/null 2>&1\nrm -f "${cleanupPath}" "${getStatePath(sessionId)}"\n`,
-            { mode: 0o755 }
-          );
-        }
-      } catch {
-        // Broker unavailable, exit silently
-        process.exit(0);
-      }
+    try {
+      await brokerPost('/session-heartbeat', {
+        session_id: sessionId,
+        pid: process.ppid || process.pid, // Use parent PID (the Claude process), not the hook's PID
+        cwd,
+        git_root: gitRoot,
+        task_summary: summary,
+      });
+    } catch {
+      // Broker unavailable, exit silently
     }
 
-    // Subsequent invocations: update summary if STATE.md changed
-    if (state && state.peerId) {
-      const now = Date.now();
-      if (now - (state.lastSummaryCheck || 0) > STALE_SUMMARY_MS) {
-        const newSummary = extractTaskSummary(cwd);
-        if (newSummary && newSummary !== state.lastSummary) {
-          try {
-            await brokerPost('/set-summary', {
-              id: state.peerId,
-              summary: newSummary,
-            });
-            state.lastSummary = newSummary;
-          } catch {
-            // non-critical
-          }
-        }
-        state.lastSummaryCheck = now;
-        writeHookState(sessionId, state);
-      }
-
-      // Also heartbeat to keep alive
-      try {
-        await brokerPost('/heartbeat', { id: state.peerId });
-      } catch {
-        // non-critical
-      }
-    }
-
-    // No additional context to inject — exit cleanly
     process.exit(0);
   } catch {
     // Silent fail — never block tool execution
