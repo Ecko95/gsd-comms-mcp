@@ -1,0 +1,48 @@
+## Peer Coordination (claude-peers)
+
+This project uses claude-peers for inter-instance communication. A broker
+daemon runs on localhost:7899 and tracks all active Claude Code instances.
+
+### Rules for All Agents
+
+1. **On startup**, your summary is automatically synced from STATE.md via the
+   `gsd-peers-sync` hook. If the hook is not active, call `set_summary` with
+   your current GSD task description.
+
+2. **Before starting a task**, check `list_peers(scope: "repo")` to see if
+   another executor is working on overlapping files. If conflict is detected,
+   message them to coordinate before proceeding.
+
+3. **When blocked**, message the orchestrator peer or the peer owning the
+   blocking dependency. Include what you need and what you've tried.
+
+4. **When you complete a task** that other peers depend on, message them:
+   "Dependency complete: [task name]. You can proceed."
+
+5. **When you receive a peer message** (via `<channel>` notification or
+   `check_messages`), respond immediately — even mid-task. Treat it like
+   a coworker tapping your shoulder.
+
+### For Orchestrators
+
+- Before dispatching a wave, spawn the `gsd-peer-coordinator` agent to check
+  for active peers and potential file conflicts.
+- After a wave completes, query peers to confirm all executors have finished
+  before advancing.
+- If an executor seems stuck (no summary update in >60s), send it a status
+  check message.
+
+### Configuration
+
+Enable in `.planning/config.json`:
+
+```json
+{
+  "hooks": {
+    "peers_sync": true
+  }
+}
+```
+
+The `gsd-peers-sync` hook must be registered in your Claude Code settings
+(see gsd-plugin/README.md for setup).
