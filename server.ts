@@ -138,6 +138,7 @@ function getTty(): string | null {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+const pendingAckIds = new Set<number>(); // Messages polled but not yet ACKed
 
 // --- MCP Server ---
 
@@ -406,7 +407,10 @@ async function pollAndPushMessages() {
 
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-    if (result.messages.length === 0) return;
+
+    // Filter out messages already pending ACK (prevents duplicate notifications)
+    const newMessages = result.messages.filter((m) => !pendingAckIds.has(m.id));
+    if (newMessages.length === 0) return;
 
     // Fetch peer list ONCE for all messages (not per-message)
     let peerMap = new Map<string, { summary: string; cwd: string }>();
@@ -425,7 +429,7 @@ async function pollAndPushMessages() {
 
     const ackedIds: number[] = [];
 
-    for (const msg of result.messages) {
+    for (const msg of newMessages) {
       const sender = peerMap.get(msg.from_id);
 
       // Push as channel notification — this is what makes it immediate
@@ -446,12 +450,18 @@ async function pollAndPushMessages() {
       log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
     }
 
-    // ACK delivered messages so they don't appear in the next poll
+    // Track pending ACKs to prevent duplicate notifications on next poll
+    for (const id of ackedIds) pendingAckIds.add(id);
+
+    // ACK delivered messages so they don't appear in future polls
     if (ackedIds.length > 0) {
       try {
         await brokerFetch("/ack-message", { message_ids: ackedIds });
+        // Clear from dedup set after successful ACK
+        for (const id of ackedIds) pendingAckIds.delete(id);
       } catch {
-        // Will retry on next poll cycle
+        // Will retry on next poll cycle — messages stay in pendingAckIds
+        // to prevent duplicate notifications
       }
     }
   } catch (e) {

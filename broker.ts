@@ -255,9 +255,14 @@ function cleanStalePeers() {
 // --- Data retention ---
 
 // Configurable via env vars (defaults: 24h messages, 7d sessions, 30d waves)
-const RETAIN_MESSAGES_MS = parseInt(process.env.CLAUDE_PEERS_RETAIN_MESSAGES_MS ?? String(24 * 60 * 60 * 1000), 10);
-const RETAIN_SESSIONS_MS = parseInt(process.env.CLAUDE_PEERS_RETAIN_SESSIONS_MS ?? String(7 * 24 * 60 * 60 * 1000), 10);
-const RETAIN_WAVES_MS = parseInt(process.env.CLAUDE_PEERS_RETAIN_WAVES_MS ?? String(30 * 24 * 60 * 60 * 1000), 10);
+function parseRetentionMs(envVar: string | undefined, defaultMs: number): number {
+  if (!envVar) return defaultMs;
+  const parsed = parseInt(envVar, 10);
+  return Number.isNaN(parsed) || parsed <= 0 ? defaultMs : parsed;
+}
+const RETAIN_MESSAGES_MS = parseRetentionMs(process.env.CLAUDE_PEERS_RETAIN_MESSAGES_MS, 24 * 60 * 60 * 1000);
+const RETAIN_SESSIONS_MS = parseRetentionMs(process.env.CLAUDE_PEERS_RETAIN_SESSIONS_MS, 7 * 24 * 60 * 60 * 1000);
+const RETAIN_WAVES_MS = parseRetentionMs(process.env.CLAUDE_PEERS_RETAIN_WAVES_MS, 30 * 24 * 60 * 60 * 1000);
 
 const pruneOldData = db.transaction(() => {
   const now = Date.now();
@@ -308,35 +313,30 @@ const pruneOldData = db.transaction(() => {
 
 // --- Stats ---
 
+function safeFileSize(path: string): number {
+  try { return Bun.file(path).size; } catch { return 0; }
+}
+
+// Snapshot-isolated: all counts taken in a single read transaction
+const getStatsCounts = db.transaction(() => ({
+  peers: (db.query("SELECT COUNT(*) as c FROM peers").get() as { c: number }).c,
+  messages_total: (db.query("SELECT COUNT(*) as c FROM messages").get() as { c: number }).c,
+  messages_undelivered: (db.query("SELECT COUNT(*) as c FROM messages WHERE delivered = 0").get() as { c: number }).c,
+  messages_delivered: (db.query("SELECT COUNT(*) as c FROM messages WHERE delivered = 1").get() as { c: number }).c,
+  sessions_active: (db.query("SELECT COUNT(*) as c FROM sessions WHERE status = 'active'").get() as { c: number }).c,
+  sessions_completed: (db.query("SELECT COUNT(*) as c FROM sessions WHERE status = 'completed'").get() as { c: number }).c,
+  waves_total: (db.query("SELECT COUNT(*) as c FROM waves").get() as { c: number }).c,
+  waves_running: (db.query("SELECT COUNT(*) as c FROM waves WHERE status = 'running'").get() as { c: number }).c,
+  waves_completed: (db.query("SELECT COUNT(*) as c FROM waves WHERE status IN ('completed', 'failed')").get() as { c: number }).c,
+  tasks_total: (db.query("SELECT COUNT(*) as c FROM task_assignments").get() as { c: number }).c,
+  tasks_running: (db.query("SELECT COUNT(*) as c FROM task_assignments WHERE status = 'running'").get() as { c: number }).c,
+  tasks_completed: (db.query("SELECT COUNT(*) as c FROM task_assignments WHERE status = 'completed'").get() as { c: number }).c,
+}));
+
 function getStats() {
-  const counts = {
-    peers: (db.query("SELECT COUNT(*) as c FROM peers").get() as { c: number }).c,
-    messages_total: (db.query("SELECT COUNT(*) as c FROM messages").get() as { c: number }).c,
-    messages_undelivered: (db.query("SELECT COUNT(*) as c FROM messages WHERE delivered = 0").get() as { c: number }).c,
-    messages_delivered: (db.query("SELECT COUNT(*) as c FROM messages WHERE delivered = 1").get() as { c: number }).c,
-    sessions_active: (db.query("SELECT COUNT(*) as c FROM sessions WHERE status = 'active'").get() as { c: number }).c,
-    sessions_completed: (db.query("SELECT COUNT(*) as c FROM sessions WHERE status = 'completed'").get() as { c: number }).c,
-    waves_total: (db.query("SELECT COUNT(*) as c FROM waves").get() as { c: number }).c,
-    waves_running: (db.query("SELECT COUNT(*) as c FROM waves WHERE status = 'running'").get() as { c: number }).c,
-    waves_completed: (db.query("SELECT COUNT(*) as c FROM waves WHERE status IN ('completed', 'failed')").get() as { c: number }).c,
-    tasks_total: (db.query("SELECT COUNT(*) as c FROM task_assignments").get() as { c: number }).c,
-    tasks_running: (db.query("SELECT COUNT(*) as c FROM task_assignments WHERE status = 'running'").get() as { c: number }).c,
-    tasks_completed: (db.query("SELECT COUNT(*) as c FROM task_assignments WHERE status = 'completed'").get() as { c: number }).c,
-  };
-
-  // DB file size
-  let db_size_bytes = 0;
-  try {
-    const file = Bun.file(DB_PATH);
-    db_size_bytes = file.size;
-  } catch {}
-
-  // WAL file size
-  let wal_size_bytes = 0;
-  try {
-    const walFile = Bun.file(`${DB_PATH}-wal`);
-    wal_size_bytes = walFile.size;
-  } catch {}
+  const counts = getStatsCounts();
+  const db_size_bytes = safeFileSize(DB_PATH);
+  const wal_size_bytes = safeFileSize(`${DB_PATH}-wal`);
 
   return {
     db_path: DB_PATH,
@@ -379,19 +379,20 @@ setInterval(() => {
 }, 2 * 60 * 1000);
 
 // VACUUM reclaims disk space (can't run inside transaction)
-function handleVacuum(): { ok: boolean; size_before: string; size_after: string } {
-  let sizeBefore = 0;
-  try { sizeBefore = Bun.file(DB_PATH).size + (Bun.file(`${DB_PATH}-wal`).size ?? 0); } catch {}
-  const before = formatBytes(sizeBefore);
+function handleVacuum(): { ok: boolean; size_before: string; size_after: string; error?: string } {
+  const before = formatBytes(safeFileSize(DB_PATH) + safeFileSize(`${DB_PATH}-wal`));
 
-  // Force WAL checkpoint first to merge WAL into main DB
-  db.run("PRAGMA wal_checkpoint(TRUNCATE)");
-  db.run("VACUUM");
+  try {
+    // Force WAL checkpoint first to merge WAL into main DB
+    db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+    db.run("VACUUM");
+  } catch (e) {
+    // SQLITE_BUSY if concurrent readers are active — non-fatal
+    const after = formatBytes(safeFileSize(DB_PATH) + safeFileSize(`${DB_PATH}-wal`));
+    return { ok: false, size_before: before, size_after: after, error: e instanceof Error ? e.message : String(e) };
+  }
 
-  let sizeAfter = 0;
-  try { sizeAfter = Bun.file(DB_PATH).size + (Bun.file(`${DB_PATH}-wal`).size ?? 0); } catch {}
-  const after = formatBytes(sizeAfter);
-
+  const after = formatBytes(safeFileSize(DB_PATH) + safeFileSize(`${DB_PATH}-wal`));
   return { ok: true, size_before: before, size_after: after };
 }
 

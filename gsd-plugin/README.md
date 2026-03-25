@@ -4,11 +4,11 @@ Integrates [claude-peers](https://github.com/ecko95/claude-peers-mcp) with [GSD 
 
 ## What It Does
 
-- **Auto-registration**: Each GSD executor registers with the claude-peers broker on first tool use
+- **Auto-registration**: Each GSD executor registers with the broker via `/session-heartbeat` on every tool use — one atomic call handles peer registration, session creation, summary sync, and heartbeat
 - **Summary sync**: Reads STATE.md and keeps the peer summary updated with the current phase/plan/task
-- **Heartbeat**: Keeps the peer alive in the broker while the session is active
-- **Conflict detection**: The peer coordinator agent checks for file-level conflicts before wave execution
-- **Cross-agent messaging**: Executors can message each other about blockers and dependency completion
+- **Orchestration state**: Waves, task assignments, and file-conflict detection all live in the broker's SQLite — no temp files or markdown parsing for state tracking
+- **Conflict detection**: The peer coordinator agent uses `/conflict-check` for structured file-level conflict detection
+- **Cross-agent messaging**: Executors can message each other with typed messages (`task_complete`, `task_blocked`, `status_request`, etc.)
 
 ## Setup
 
@@ -76,17 +76,41 @@ cp /path/to/claude-peers-mcp/gsd-plugin/agents/gsd-peer-coordinator.md \
 ```
 GSD Orchestrator
   │
-  ├─ spawns Executor A ──► gsd-peers-sync hook ──► broker /register
-  │                         (PostToolUse)           broker /set-summary (from STATE.md)
-  │                                                 broker /heartbeat (ongoing)
+  ├─ calls /wave-create ──────────────► broker creates wave + task assignments
+  │
+  ├─ spawns Executor A ──► gsd-peers-sync hook ──► broker /session-heartbeat
+  │                         (PostToolUse)           (atomic: register peer + create session
+  │                                                  + sync summary + heartbeat)
   │
   ├─ spawns Executor B ──► same flow
   │
-  └─ spawns Peer Coordinator ──► broker /list-peers
-                                  broker /send-message (if requested)
+  ├─ calls /task-start ───────────────► broker assigns session to task
+  │                                      (validates status + checks file conflicts)
+  │
+  ├─ Executor completes ──► /task-complete ──► broker checks if wave is done
+  │
+  └─ spawns Peer Coordinator ──► broker /conflict-check  (structured file conflicts)
+                                  broker /wave-status     (structured task state)
+                                  broker /send-message    (typed messages)
 ```
 
 The hook communicates directly with the broker's HTTP API — no MCP server needed. This keeps it lightweight and compatible with any GSD runtime (Claude Code, Gemini CLI, etc.).
+
+## Monitoring
+
+```bash
+# Check DB size, row counts, retention policy
+bun cli.ts stats
+
+# Force cleanup + VACUUM to reclaim disk space
+bun cli.ts prune
+
+# Find the database file
+bun cli.ts db-path
+
+# Or hit the broker directly
+curl -s http://localhost:7899/stats | jq .
+```
 
 ## Configuration Reference
 
@@ -94,3 +118,7 @@ The hook communicates directly with the broker's HTTP API — no MCP server need
 |---|---|---|---|
 | `hooks.peers_sync` | `.planning/config.json` | `true` | Enable/disable the peers sync hook |
 | `CLAUDE_PEERS_PORT` | Environment | `7899` | Broker port override |
+| `CLAUDE_PEERS_DB` | Environment | `~/.claude-peers.db` | Database path override |
+| `CLAUDE_PEERS_RETAIN_MESSAGES_MS` | Environment | `86400000` (24h) | Delivered message retention |
+| `CLAUDE_PEERS_RETAIN_SESSIONS_MS` | Environment | `604800000` (7d) | Completed session retention |
+| `CLAUDE_PEERS_RETAIN_WAVES_MS` | Environment | `2592000000` (30d) | Completed wave retention |
