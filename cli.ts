@@ -222,12 +222,10 @@ switch (cmd) {
         if (result.tasks_pruned > 0) console.log(`  ${result.tasks_pruned} task assignment(s)`);
       }
 
-      // Also run VACUUM to reclaim disk space
+      // VACUUM to reclaim disk space
       console.log("\nRunning VACUUM to reclaim disk space...");
-      // VACUUM needs to be done directly since it can't run inside the broker's transaction
-      // We'll just show the before/after size from stats
-      const stats = await brokerFetch<{ db_size_human: string }>("/stats");
-      console.log(`Database size: ${stats.db_size_human}`);
+      const vacuum = await brokerFetch<{ ok: boolean; size_before: string; size_after: string }>("/vacuum", {});
+      console.log(`Size: ${vacuum.size_before} -> ${vacuum.size_after}`);
     } catch {
       console.log("Broker is not running. Start it first to prune data.");
     }

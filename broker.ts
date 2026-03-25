@@ -113,6 +113,23 @@ if (currentVersion < 1) {
   db.run("INSERT INTO schema_version (version) VALUES (1)");
 }
 
+// --- Indexes (idempotent, safe to run on every startup) ---
+
+// Covering index for the hot path: poll undelivered messages per peer
+db.run("CREATE INDEX IF NOT EXISTS idx_messages_undelivered ON messages(to_id, delivered) WHERE delivered = 0");
+
+// Index for message retention prune (delivered messages by delivered_at)
+db.run("CREATE INDEX IF NOT EXISTS idx_messages_delivered_at ON messages(delivered_at) WHERE delivered = 1");
+
+// Index for conflict check + wave status queries
+db.run("CREATE INDEX IF NOT EXISTS idx_tasks_wave_status ON task_assignments(wave_id, status)");
+
+// Index for session lookup by peer_id (used in cleanup)
+db.run("CREATE INDEX IF NOT EXISTS idx_sessions_peer_id ON sessions(peer_id)");
+
+// Index for peer lookup by PID (used in re-registration)
+db.run("CREATE INDEX IF NOT EXISTS idx_peers_pid ON peers(pid)");
+
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
@@ -351,6 +368,32 @@ setInterval(cleanStalePeers, 30_000);
 setInterval(() => { pruneOldData(); }, 5 * 60 * 1000);
 // Also prune on startup
 pruneOldData();
+
+// WAL checkpoint every 2 minutes to keep WAL file bounded
+setInterval(() => {
+  try {
+    db.run("PRAGMA wal_checkpoint(PASSIVE)");
+  } catch {
+    // Non-critical
+  }
+}, 2 * 60 * 1000);
+
+// VACUUM reclaims disk space (can't run inside transaction)
+function handleVacuum(): { ok: boolean; size_before: string; size_after: string } {
+  let sizeBefore = 0;
+  try { sizeBefore = Bun.file(DB_PATH).size + (Bun.file(`${DB_PATH}-wal`).size ?? 0); } catch {}
+  const before = formatBytes(sizeBefore);
+
+  // Force WAL checkpoint first to merge WAL into main DB
+  db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+  db.run("VACUUM");
+
+  let sizeAfter = 0;
+  try { sizeAfter = Bun.file(DB_PATH).size + (Bun.file(`${DB_PATH}-wal`).size ?? 0); } catch {}
+  const after = formatBytes(sizeAfter);
+
+  return { ok: true, size_before: before, size_after: after };
+}
 
 // --- Generate peer ID ---
 
@@ -747,6 +790,8 @@ Bun.serve({
         // --- Maintenance ---
         case "/prune":
           return Response.json(pruneOldData());
+        case "/vacuum":
+          return Response.json(handleVacuum());
 
         default:
           return Response.json({ error: "not found" }, { status: 404 });

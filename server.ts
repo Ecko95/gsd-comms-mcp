@@ -408,26 +408,25 @@ async function pollAndPushMessages() {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
     if (result.messages.length === 0) return;
 
+    // Fetch peer list ONCE for all messages (not per-message)
+    let peerMap = new Map<string, { summary: string; cwd: string }>();
+    try {
+      const peers = await brokerFetch<Peer[]>("/list-peers", {
+        scope: "machine",
+        cwd: myCwd,
+        git_root: myGitRoot,
+      });
+      for (const p of peers) {
+        peerMap.set(p.id, { summary: p.summary, cwd: p.cwd });
+      }
+    } catch {
+      // Non-critical, proceed without sender info
+    }
+
     const ackedIds: number[] = [];
 
     for (const msg of result.messages) {
-      // Look up the sender's info for context
-      let fromSummary = "";
-      let fromCwd = "";
-      try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", {
-          scope: "machine",
-          cwd: myCwd,
-          git_root: myGitRoot,
-        });
-        const sender = peers.find((p) => p.id === msg.from_id);
-        if (sender) {
-          fromSummary = sender.summary;
-          fromCwd = sender.cwd;
-        }
-      } catch {
-        // Non-critical, proceed without sender info
-      }
+      const sender = peerMap.get(msg.from_id);
 
       // Push as channel notification — this is what makes it immediate
       await mcp.notification({
@@ -436,8 +435,8 @@ async function pollAndPushMessages() {
           content: msg.text,
           meta: {
             from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
+            from_summary: sender?.summary ?? "",
+            from_cwd: sender?.cwd ?? "",
             sent_at: msg.sent_at,
           },
         },

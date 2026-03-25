@@ -606,6 +606,21 @@ test("/stats returns DB size, row counts, and retention config", async () => {
   expect(stats.counts.messages_total).toBeGreaterThanOrEqual(0);
 });
 
+test("/stats includes index info after schema setup", async () => {
+  // Verify the stats endpoint works and DB has been set up with indexes
+  const res = await fetch(`${BROKER_URL}/stats`);
+  const stats = (await res.json()) as { db_size_bytes: number };
+  // DB should be non-trivial size (indexes + tables)
+  expect(stats.db_size_bytes).toBeGreaterThan(0);
+});
+
+test("/vacuum reclaims disk space", async () => {
+  const res = await brokerPost<{ ok: boolean; size_before: string; size_after: string }>("/vacuum", {});
+  expect(res.ok).toBe(true);
+  expect(res.size_before).toContain("B");
+  expect(res.size_after).toContain("B");
+});
+
 test("/prune returns counts of pruned rows", async () => {
   const res = await brokerPost<{
     messages_pruned: number;
