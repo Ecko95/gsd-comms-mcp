@@ -110,50 +110,8 @@ if (currentVersion < 1) {
     )
   `);
 
-  if (currentVersion === 0) {
-    db.run("INSERT INTO schema_version (version) VALUES (1)");
-  } else {
-    db.run("UPDATE schema_version SET version = 1");
-  }
+  db.run("INSERT INTO schema_version (version) VALUES (1)");
 }
-
-// Migration for existing databases: add new columns to messages if missing
-try {
-  db.run("SELECT msg_type FROM messages LIMIT 0");
-} catch {
-  db.run("ALTER TABLE messages ADD COLUMN msg_type TEXT NOT NULL DEFAULT 'chat'");
-  db.run("ALTER TABLE messages ADD COLUMN payload TEXT NOT NULL DEFAULT '{}'");
-  db.run("ALTER TABLE messages ADD COLUMN delivered_at TEXT");
-}
-
-// Clean up stale peers (PIDs that no longer exist) on startup
-// Wrapped in a transaction so peer + message cleanup is atomic
-const cleanStalePeerTxn = db.transaction((peerId: string) => {
-  db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peerId]);
-  // Detach task assignments from sessions being deleted (SET NULL, not delete)
-  const sessions = db.query("SELECT session_id FROM sessions WHERE peer_id = ?").all(peerId) as { session_id: string }[];
-  for (const s of sessions) {
-    db.run("UPDATE task_assignments SET session_id = NULL WHERE session_id = ?", [s.session_id]);
-  }
-  db.run("DELETE FROM sessions WHERE peer_id = ?", [peerId]);
-  db.run("DELETE FROM peers WHERE id = ?", [peerId]);
-});
-
-function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
-  for (const peer of peers) {
-    try {
-      process.kill(peer.pid, 0);
-    } catch {
-      cleanStalePeerTxn(peer.id);
-    }
-  }
-}
-
-cleanStalePeers();
-
-// Periodically clean stale peers (every 30s)
-setInterval(cleanStalePeers, 30_000);
 
 // --- Prepared statements ---
 
@@ -247,6 +205,40 @@ const assignTaskSession = db.prepare(`
   UPDATE task_assignments SET session_id = ? WHERE id = ?
 `);
 
+// --- Shared cleanup helper (used inside transactions) ---
+
+// Fully clean a peer and all its FK references: messages, task_assignments, sessions, then peer
+function cleanPeerRefs(peerId: string) {
+  db.run("DELETE FROM messages WHERE from_id = ? OR to_id = ?", [peerId, peerId]);
+  const sessions = db.query("SELECT session_id FROM sessions WHERE peer_id = ?").all(peerId) as { session_id: string }[];
+  for (const s of sessions) {
+    db.run("UPDATE task_assignments SET session_id = NULL WHERE session_id = ?", [s.session_id]);
+  }
+  db.run("DELETE FROM sessions WHERE peer_id = ?", [peerId]);
+  deletePeer.run(peerId);
+}
+
+// Wrap in transaction for use as standalone cleanup
+const cleanStalePeerTxn = db.transaction((peerId: string) => {
+  cleanPeerRefs(peerId);
+});
+
+// Clean up stale peers (PIDs that no longer exist)
+function cleanStalePeers() {
+  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+  for (const peer of peers) {
+    try {
+      process.kill(peer.pid, 0);
+    } catch {
+      cleanStalePeerTxn(peer.id);
+    }
+  }
+}
+
+// Run on startup and periodically
+cleanStalePeers();
+setInterval(cleanStalePeers, 30_000);
+
 // --- Generate peer ID ---
 
 function generateId(): string {
@@ -260,14 +252,11 @@ function generateId(): string {
 
 // --- Request handlers ---
 
-// Atomic registration: clean old PID + insert new peer in one transaction
 const registerTxn = db.transaction((id: string, pid: number, cwd: string, git_root: string | null, tty: string | null, summary: string, now: string) => {
   // Remove any existing registration for this PID (re-registration)
   const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(pid) as { id: string } | null;
   if (existing) {
-    db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [existing.id]);
-    db.run("DELETE FROM sessions WHERE peer_id = ?", [existing.id]);
-    deletePeer.run(existing.id);
+    cleanPeerRefs(existing.id);
   }
   insertPeer.run(id, pid, cwd, git_root, tty, summary, now, now);
   return id;
@@ -348,18 +337,10 @@ function handleSendMessage(body: SendMessageRequest & { msg_type?: string; paylo
   );
 }
 
-// Atomic poll: select + mark delivered in one transaction
-const pollMessagesTxn = db.transaction((peerId: string): Message[] => {
-  const messages = selectUndelivered.all(peerId) as Message[];
-  const now = new Date().toISOString();
-  for (const msg of messages) {
-    markDelivered.run(now, msg.id);
-  }
-  return messages;
-});
-
+// Poll returns undelivered messages WITHOUT marking them delivered.
+// Client must call /ack-message with the message IDs after processing.
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
-  const messages = pollMessagesTxn(body.id);
+  const messages = selectUndelivered.all(body.id) as Message[];
   return { messages };
 }
 
@@ -398,12 +379,10 @@ const sessionHeartbeatTxn = db.transaction((body: SessionHeartbeatRequest): { pe
   } else {
     // Register new peer + session atomically
     peerId = generateId();
-    // Clean any existing peer for this PID
+    // Clean any existing peer for this PID (reuse shared cleanup)
     const oldPeer = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
     if (oldPeer) {
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [oldPeer.id]);
-      db.run("DELETE FROM sessions WHERE peer_id = ?", [oldPeer.id]);
-      deletePeer.run(oldPeer.id);
+      cleanPeerRefs(oldPeer.id);
     }
     insertPeer.run(peerId, body.pid, body.cwd, body.git_root, body.tty ?? null, body.task_summary, now, now);
     upsertSession.run(body.session_id, peerId, body.cwd, body.git_root, body.task_summary, now, now);
@@ -427,9 +406,9 @@ const sessionEndTxn = db.transaction((sessionId: string) => {
     endSession.run(sessionId);
     // Detach task assignments from this session
     db.run("UPDATE task_assignments SET session_id = NULL WHERE session_id = ?", [sessionId]);
-    // Clean peer + messages (session row stays with status=completed)
+    // Clean peer + all message refs (session row stays with status=completed)
     if (session.peer_id) {
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [session.peer_id]);
+      db.run("DELETE FROM messages WHERE from_id = ? OR to_id = ?", [session.peer_id, session.peer_id]);
       db.run("DELETE FROM peers WHERE id = ?", [session.peer_id]);
     }
   }
@@ -488,7 +467,7 @@ function handleWaveStatus(body: { wave_id: number }): unknown {
 const taskStartTxn = db.transaction((taskId: number, sessionId: string): { ok: boolean; error?: string } => {
   const task = getTaskAssignment.get(taskId) as { status: string; files: string; wave_id: number } | null;
   if (!task) return { ok: false, error: "Task not found" };
-  if (task.status !== "pending") return { ok: false, error: `Task already ${task.status}` };
+  if (task.status !== "pending" && task.status !== "blocked") return { ok: false, error: `Task already ${task.status}` };
 
   // Check for file conflicts with other running tasks in the same wave
   const taskFiles: string[] = JSON.parse(task.files);

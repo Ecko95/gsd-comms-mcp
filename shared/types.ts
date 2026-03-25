@@ -22,7 +22,7 @@ export interface Message {
   msg_type: MessageType;
   payload: string; // JSON string
   sent_at: string; // ISO timestamp
-  delivered: boolean;
+  delivered: number; // 0 = undelivered, 1 = delivered (SQLite INTEGER)
   delivered_at: string | null;
 }
 

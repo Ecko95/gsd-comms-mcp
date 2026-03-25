@@ -406,6 +406,9 @@ async function pollAndPushMessages() {
 
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    if (result.messages.length === 0) return;
+
+    const ackedIds: number[] = [];
 
     for (const msg of result.messages) {
       // Look up the sender's info for context
@@ -440,7 +443,17 @@ async function pollAndPushMessages() {
         },
       });
 
+      ackedIds.push(msg.id);
       log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+    }
+
+    // ACK delivered messages so they don't appear in the next poll
+    if (ackedIds.length > 0) {
+      try {
+        await brokerFetch("/ack-message", { message_ids: ackedIds });
+      } catch {
+        // Will retry on next poll cycle
+      }
     }
   } catch (e) {
     // Broker might be down temporarily, don't crash
