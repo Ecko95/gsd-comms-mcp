@@ -235,9 +235,122 @@ function cleanStalePeers() {
   }
 }
 
+// --- Data retention ---
+
+// Configurable via env vars (defaults: 24h messages, 7d sessions, 30d waves)
+const RETAIN_MESSAGES_MS = parseInt(process.env.CLAUDE_PEERS_RETAIN_MESSAGES_MS ?? String(24 * 60 * 60 * 1000), 10);
+const RETAIN_SESSIONS_MS = parseInt(process.env.CLAUDE_PEERS_RETAIN_SESSIONS_MS ?? String(7 * 24 * 60 * 60 * 1000), 10);
+const RETAIN_WAVES_MS = parseInt(process.env.CLAUDE_PEERS_RETAIN_WAVES_MS ?? String(30 * 24 * 60 * 60 * 1000), 10);
+
+const pruneOldData = db.transaction(() => {
+  const now = Date.now();
+
+  // Prune delivered messages older than retention period
+  const msgCutoff = new Date(now - RETAIN_MESSAGES_MS).toISOString();
+  const msgResult = db.run(
+    "DELETE FROM messages WHERE delivered = 1 AND delivered_at IS NOT NULL AND delivered_at < ?",
+    [msgCutoff]
+  );
+
+  // Prune completed sessions older than retention period
+  const sessCutoff = new Date(now - RETAIN_SESSIONS_MS).toISOString();
+  // First detach any task assignments referencing old sessions
+  const oldSessions = db.query(
+    "SELECT session_id FROM sessions WHERE status = 'completed' AND last_tool_use < ?"
+  ).all(sessCutoff) as { session_id: string }[];
+  for (const s of oldSessions) {
+    db.run("UPDATE task_assignments SET session_id = NULL WHERE session_id = ?", [s.session_id]);
+  }
+  const sessResult = db.run(
+    "DELETE FROM sessions WHERE status = 'completed' AND last_tool_use < ?",
+    [sessCutoff]
+  );
+
+  // Prune completed waves (and their task_assignments) older than retention period
+  const waveCutoff = new Date(now - RETAIN_WAVES_MS).toISOString();
+  const oldWaves = db.query(
+    "SELECT id FROM waves WHERE status IN ('completed', 'failed') AND completed_at IS NOT NULL AND completed_at < ?"
+  ).all(waveCutoff) as { id: number }[];
+  let tasksDeleted = 0;
+  for (const w of oldWaves) {
+    const r = db.run("DELETE FROM task_assignments WHERE wave_id = ?", [w.id]);
+    tasksDeleted += r.changes;
+  }
+  const waveResult = db.run(
+    "DELETE FROM waves WHERE status IN ('completed', 'failed') AND completed_at IS NOT NULL AND completed_at < ?",
+    [waveCutoff]
+  );
+
+  return {
+    messages_pruned: msgResult.changes,
+    sessions_pruned: sessResult.changes,
+    waves_pruned: waveResult.changes,
+    tasks_pruned: tasksDeleted,
+  };
+});
+
+// --- Stats ---
+
+function getStats() {
+  const counts = {
+    peers: (db.query("SELECT COUNT(*) as c FROM peers").get() as { c: number }).c,
+    messages_total: (db.query("SELECT COUNT(*) as c FROM messages").get() as { c: number }).c,
+    messages_undelivered: (db.query("SELECT COUNT(*) as c FROM messages WHERE delivered = 0").get() as { c: number }).c,
+    messages_delivered: (db.query("SELECT COUNT(*) as c FROM messages WHERE delivered = 1").get() as { c: number }).c,
+    sessions_active: (db.query("SELECT COUNT(*) as c FROM sessions WHERE status = 'active'").get() as { c: number }).c,
+    sessions_completed: (db.query("SELECT COUNT(*) as c FROM sessions WHERE status = 'completed'").get() as { c: number }).c,
+    waves_total: (db.query("SELECT COUNT(*) as c FROM waves").get() as { c: number }).c,
+    waves_running: (db.query("SELECT COUNT(*) as c FROM waves WHERE status = 'running'").get() as { c: number }).c,
+    waves_completed: (db.query("SELECT COUNT(*) as c FROM waves WHERE status IN ('completed', 'failed')").get() as { c: number }).c,
+    tasks_total: (db.query("SELECT COUNT(*) as c FROM task_assignments").get() as { c: number }).c,
+    tasks_running: (db.query("SELECT COUNT(*) as c FROM task_assignments WHERE status = 'running'").get() as { c: number }).c,
+    tasks_completed: (db.query("SELECT COUNT(*) as c FROM task_assignments WHERE status = 'completed'").get() as { c: number }).c,
+  };
+
+  // DB file size
+  let db_size_bytes = 0;
+  try {
+    const file = Bun.file(DB_PATH);
+    db_size_bytes = file.size;
+  } catch {}
+
+  // WAL file size
+  let wal_size_bytes = 0;
+  try {
+    const walFile = Bun.file(`${DB_PATH}-wal`);
+    wal_size_bytes = walFile.size;
+  } catch {}
+
+  return {
+    db_path: DB_PATH,
+    db_size_bytes,
+    db_size_human: formatBytes(db_size_bytes + wal_size_bytes),
+    wal_size_bytes,
+    schema_version: currentVersion < 1 ? 1 : currentVersion,
+    retention: {
+      messages_hours: Math.round(RETAIN_MESSAGES_MS / (60 * 60 * 1000)),
+      sessions_days: Math.round(RETAIN_SESSIONS_MS / (24 * 60 * 60 * 1000)),
+      waves_days: Math.round(RETAIN_WAVES_MS / (24 * 60 * 60 * 1000)),
+    },
+    counts,
+  };
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
 // Run on startup and periodically
 cleanStalePeers();
 setInterval(cleanStalePeers, 30_000);
+
+// Auto-prune every 5 minutes
+setInterval(() => { pruneOldData(); }, 5 * 60 * 1000);
+// Also prune on startup
+pruneOldData();
 
 // --- Generate peer ID ---
 
@@ -576,6 +689,9 @@ Bun.serve({
       if (path === "/health") {
         return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
       }
+      if (path === "/stats") {
+        return Response.json(getStats());
+      }
       return new Response("claude-peers broker", { status: 200 });
     }
 
@@ -627,6 +743,10 @@ Bun.serve({
         // --- Message ACK ---
         case "/ack-message":
           return Response.json(handleAckMessage(body as { message_ids: number[] }));
+
+        // --- Maintenance ---
+        case "/prune":
+          return Response.json(pruneOldData());
 
         default:
           return Response.json({ error: "not found" }, { status: 404 });

@@ -581,3 +581,42 @@ test("unregister succeeds even when peer has delivered messages (FK regression)"
   const res2 = await brokerPost<{ ok: boolean }>("/unregister", { id: receiver.id });
   expect(res2.ok).toBe(true);
 });
+
+// --- Stats + monitoring ---
+
+test("/stats returns DB size, row counts, and retention config", async () => {
+  const res = await fetch(`${BROKER_URL}/stats`);
+  const stats = (await res.json()) as {
+    db_path: string;
+    db_size_bytes: number;
+    db_size_human: string;
+    schema_version: number;
+    retention: { messages_hours: number; sessions_days: number; waves_days: number };
+    counts: { peers: number; messages_total: number; sessions_active: number; waves_total: number; tasks_total: number };
+  };
+
+  expect(stats.db_path).toBeString();
+  expect(stats.db_size_bytes).toBeGreaterThan(0);
+  expect(stats.db_size_human).toContain("B"); // e.g. "32.0 KB"
+  expect(stats.schema_version).toBe(1);
+  expect(stats.retention.messages_hours).toBe(24);
+  expect(stats.retention.sessions_days).toBe(7);
+  expect(stats.retention.waves_days).toBe(30);
+  expect(stats.counts.peers).toBeGreaterThanOrEqual(0);
+  expect(stats.counts.messages_total).toBeGreaterThanOrEqual(0);
+});
+
+test("/prune returns counts of pruned rows", async () => {
+  const res = await brokerPost<{
+    messages_pruned: number;
+    sessions_pruned: number;
+    waves_pruned: number;
+    tasks_pruned: number;
+  }>("/prune", {});
+
+  // On a fresh test DB with default 24h retention, nothing should be old enough to prune
+  expect(res.messages_pruned).toBeGreaterThanOrEqual(0);
+  expect(res.sessions_pruned).toBeGreaterThanOrEqual(0);
+  expect(res.waves_pruned).toBeGreaterThanOrEqual(0);
+  expect(res.tasks_pruned).toBeGreaterThanOrEqual(0);
+});
